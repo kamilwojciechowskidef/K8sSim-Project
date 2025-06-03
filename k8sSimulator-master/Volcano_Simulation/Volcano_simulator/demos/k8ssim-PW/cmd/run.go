@@ -6,21 +6,53 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
+	"sort"
+	"strconv"
 
-	// Volcano API → NodeInfo
+	// Volcano API → NodeInfo, Resource
 	api "volcano.sh/volcano/pkg/scheduler/api"
 	// Loader z dnia 2 → PodSpec, Workload
 	workload "volcano.sh/volcano/demos/k8ssim-PW/internal/workload"
-	// Nasz scheduler binpack
+	// Nasz scheduler BinPack
 	"volcano.sh/volcano/demos/k8ssim-PW/internal/scheduler"
 )
 
 // PodResult to struktura używana do zapisania wyników (CSV).
 type PodResult struct {
-	PodName      string
-	AssignTimeMs int64 // czas przydziału: ms od startu symulacji
-	NodeName     string
+	PodName       string
+	AssignTimeMs  int64 // czas przydziału
+	ReleaseTimeMs int64 // czas zwolnienia (po Lifetime)
+	NodeName      string
+}
+
+// simEvent pozwala nam kolejkować zdarzenia w kolejności czasowej.
+type eventType int
+
+const (
+	assignEvent eventType = iota
+	releaseEvent
+)
+
+type simEvent struct {
+	timeMs      int64 // moment zdarzenia (ms od startu symulacji)
+	podSpec     *workload.PodSpec
+	podName     string
+	nodeIndex   int       // indeks węzła w slice nodes, gdy węzeł został przydzielony
+	resultIndex int       // indeks w results[], żeby potem wstawić ReleaseTimeMs
+	evType      eventType // assignEvent lub releaseEvent
+
+	paired *simEvent // wskaźnik na odpowiadające zdarzenie (assign ↔ release)
+}
+
+// indexOf zwraca indeks elementu target w slice nodes.
+// Jeśli nie znajdzie, zwraca -1.
+func indexOf(nodes []*api.NodeInfo, target *api.NodeInfo) int {
+	for i, n := range nodes {
+		if n == target {
+			return i
+		}
+	}
+	return -1
 }
 
 // exportMetricsCSV zapisuje slice PodResult do pliku CSV pod ścieżką path.
@@ -37,8 +69,8 @@ func exportMetricsCSV(results []PodResult, path string) error {
 	w := csv.NewWriter(f)
 	defer w.Flush()
 
-	// Nagłówek
-	if err := w.Write([]string{"pod_name", "assign_time_ms", "node_name"}); err != nil {
+	// Nagłówek (dodaliśmy kolumnę release_time_ms)
+	if err := w.Write([]string{"pod_name", "assign_time_ms", "release_time_ms", "node_name"}); err != nil {
 		return err
 	}
 
@@ -46,6 +78,7 @@ func exportMetricsCSV(results []PodResult, path string) error {
 		rec := []string{
 			r.PodName,
 			fmt.Sprintf("%d", r.AssignTimeMs),
+			fmt.Sprintf("%d", r.ReleaseTimeMs),
 			r.NodeName,
 		}
 		w.Write(rec)
@@ -54,10 +87,10 @@ func exportMetricsCSV(results []PodResult, path string) error {
 }
 
 func main() {
-	// 1. Parsowanie flag: --workload=<ścieżka_do_yaml> oraz --nodes=<ilość_węzłów>
+	// 1. Parsowanie flag: --workload=<ścieżka> oraz --nodes=<liczba>
 	var workloadPath string
 	var numNodes int
-	flag.StringVar(&workloadPath, "workload", "", "Ścieżka do pliku YAML z workloadem (np. demos/k8ssim-PW/workloads/burst.yaml)")
+	flag.StringVar(&workloadPath, "workload", "", "Ścieżka do pliku YAML z workloadem (np. demos/k8ssim-PW/workloads/spread.yaml)")
 	flag.IntVar(&numNodes, "nodes", 5, "Liczba węzłów w klastrze (domyślnie 5)")
 	flag.Parse()
 
@@ -66,80 +99,147 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 2. Wczytanie workloadu (działamy loaderem z dnia 2)
+	// 2. Wczytanie workloadu (loader dnia 2)
 	wl, err := workload.LoadWorkload(workloadPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Błąd wczytywania workloadu: %v\n", err)
 		os.Exit(1)
 	}
 
-	// 3. Utworzenie listy węzłów (NodeInfo), każdy z przydzielonymi, przykładowymi zasobami
-	//    (np. 1000 milicores CPU i 2048 MiB pamięci). Każdy węzeł to *api.NodeInfo.
+	// 3. Utworzenie listy węzłów (NodeInfo) z przykładowymi zasobami
 	nodes := make([]*api.NodeInfo, numNodes)
 	for i := 0; i < numNodes; i++ {
-		// Tworzymy "pusty" Resource, a następnie wypełniamy pola na podstawie
-		// przyjętych założeń. Możemy skorzystać z konstruktora NewResource(nil)
-		// i nadpisać pola Manualnie, albo zbudować ręcznie.
 		alloc := api.NewResource(nil)
 		alloc.MilliCPU = 1000 // 1000 milicores
 		alloc.Memory = 2048   // 2048 MiB
 
 		used := api.EmptyResource()
 
-		// NodeInfo wymaga podania obiektu *v1.Node, ale do naszej lekkiej symulacji
-		// wystarczy nadać mu nil i ręcznie przypisać pola Allocatable/Used:
 		nodeInfo := &api.NodeInfo{
 			Name:        fmt.Sprintf("node-%d", i),
-			Node:        nil, // nie operujemy na prawdziwym obiekcie K8s
+			Node:        nil,
 			Allocatable: alloc,
 			Used:        used,
-			// Pozostałe pola wykorzystamy tylko do schedulera, więc ustawiamy:
-			Idle:       alloc.Clone(), // po starcie wszystkie zasoby są wolne
-			Capability: alloc.Clone(),
-			Releasing:  api.EmptyResource(),
-			Pipelined:  api.EmptyResource(),
+			Idle:        alloc.Clone(),
+			Capability:  alloc.Clone(),
+			Releasing:   api.EmptyResource(),
+			Pipelined:   api.EmptyResource(),
 		}
 		nodes[i] = nodeInfo
 	}
 
-	// 4. Utworzenie instancji BinPack i zresetowanie stanu zasobów (na wszelki wypadek)
+	// Utworzenie BinPack i wyzerowanie użycia zasobów
 	binpack := scheduler.NewBinPack(nodes)
 	binpack.ResetResourceUsage()
 
-	// 5. „Symulacja”:
-	//    Dla każdego PodSpec w wl.Pods wykonujemy tyle instancji, ile wskazuje Replicas.
-	//    Każdy instancja otrzymuje unikalną nazwę (image + indeks) oraz mierzymy czas
-	//    przydziału w milisekundach od momentu startu programu.
-	startTime := time.Now()
+	// 4. Budowanie listy eventów (assign + release), w parach
 	var results []PodResult
+	var events []simEvent
 
 	for _, ps := range wl.Pods {
 		for i := 0; i < ps.Replicas; i++ {
-			// Generujemy unikalną nazwę: image-n
-			podName := fmt.Sprintf("%s-%d", ps.Image, i)
+			// 4.1. Tworzymy oddzielną kopię PodSpec:
+			psCopy := ps
+			podName := fmt.Sprintf("%s-%d", psCopy.Image, i)
 
-			// Ile już minęło od startu w ms:
-			elapsed := time.Since(startTime)
-			assignMs := elapsed.Milliseconds()
-
-			// Próba przydziału:
-			node, err := binpack.Schedule(&ps)
-			if err != nil {
-				// Brak dostępnych zasobów: wypisz ostrzeżenie i pomiń ten pod
-				fmt.Fprintf(os.Stderr, "UWAGA: nie udało się przydzielić poda %s: %v\n", podName, err)
-				continue
+			// 4.2. assignEvent – moment, w którym próbujemy przydzielić
+			submitMs := psCopy.SubmitAt.Milliseconds()
+			evAssign := simEvent{
+				timeMs:      submitMs,
+				podSpec:     &psCopy,
+				podName:     podName,
+				nodeIndex:   -1,
+				resultIndex: -1,
+				evType:      assignEvent,
+				paired:      nil,
 			}
+			events = append(events, evAssign)
 
-			// Zapisujemy wynik:
-			results = append(results, PodResult{
-				PodName:      podName,
-				AssignTimeMs: assignMs,
-				NodeName:     node.Name,
-			})
+			// 4.3. releaseEvent – moment, w którym pod kończy Lifetime
+			releaseMs := submitMs + psCopy.Lifetime.Milliseconds()
+			evRelease := simEvent{
+				timeMs:      releaseMs,
+				podSpec:     &psCopy,
+				podName:     podName,
+				nodeIndex:   -1,
+				resultIndex: -1,
+				evType:      releaseEvent,
+				paired:      nil,
+			}
+			events = append(events, evRelease)
+
+			// 4.4. Łączymy oba wydarzenia nawzajem wskaźnikami
+			assignIdx := len(events) - 2  // indeks evAssign
+			releaseIdx := len(events) - 1 // indeks evRelease
+			events[assignIdx].paired = &events[releaseIdx]
+			events[releaseIdx].paired = &events[assignIdx]
 		}
 	}
 
-	// 6. Zapis wyników do CSV
+	// 5. Sortowanie eventów rosnąco po timeMs
+	sort.Slice(events, func(i, j int) bool {
+		return events[i].timeMs < events[j].timeMs
+	})
+
+	// 6. Przetwarzanie eventów w kolejności czasowej
+	for idx := range events {
+		ev := &events[idx]
+		switch ev.evType {
+		case assignEvent:
+			// — DEBUG (opcjonalnie) —
+			fmt.Printf("[DEBUG-ASSIGN] Próba assignEvent dla %s (submit_ms=%d)\n", ev.podName, ev.timeMs)
+
+			chosenNode, err := binpack.Schedule(ev.podSpec)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[DEBUG-ASSIGN] node NOT found dla %s: %v\n", ev.podName, err)
+				continue
+			}
+			fmt.Printf("[DEBUG-ASSIGN] Przydzieliłem %s do węzła %s\n", ev.podName, chosenNode.Name)
+
+			// Dodanie rekordu do results i zapis indeksu
+			resultIdx := len(results)
+			results = append(results, PodResult{
+				PodName:       ev.podName,
+				AssignTimeMs:  ev.timeMs,
+				ReleaseTimeMs: 0,
+				NodeName:      chosenNode.Name,
+			})
+			ev.nodeIndex = indexOf(nodes, chosenNode)
+			ev.resultIndex = resultIdx
+			fmt.Printf("[DEBUG-ASSIGN] Ustawiono ev.nodeIndex=%d, ev.resultIndex=%d dla %s\n",
+				ev.nodeIndex, ev.resultIndex, ev.podName)
+
+			// **Kluczowe**: przekazujemy tę wartość do odpowiadającego releaseEvent
+			if ev.paired != nil {
+				ev.paired.nodeIndex = ev.nodeIndex
+				ev.paired.resultIndex = ev.resultIndex
+			}
+
+		case releaseEvent:
+			// Debug: czy trafiamy do releaseEvent?
+			if ev.nodeIndex < 0 || ev.resultIndex < 0 || ev.resultIndex >= len(results) {
+				fmt.Printf("[DEBUG-RELEASE] Pomijam releaseEvent dla %s: nodeIndex=%d, resultIndex=%d\n",
+					ev.podName, ev.nodeIndex, ev.resultIndex)
+				continue
+			}
+			fmt.Printf("[DEBUG-RELEASE] Wykonuję releaseEvent dla %s: timeMs=%d, nodeIndex=%d, resultIndex=%d\n",
+				ev.podName, ev.timeMs, ev.nodeIndex, ev.resultIndex)
+
+			cpuReq, err1 := strconv.ParseFloat(ev.podSpec.CPU, 64)
+			memReq, err2 := strconv.ParseFloat(ev.podSpec.Memory, 64)
+			if err1 != nil || err2 != nil {
+				continue
+			}
+			nodeToFree := nodes[ev.nodeIndex]
+			nodeToFree.Used.MilliCPU -= cpuReq
+			nodeToFree.Used.Memory -= memReq
+
+			// Nadpisujemy ReleaseTimeMs
+			results[ev.resultIndex].ReleaseTimeMs = ev.timeMs
+		}
+	}
+
+	// 7. Zapis wyników do CSV
 	csvPath := fmt.Sprintf("metrics/%s_binpack.csv", filepath.Base(workloadPath))
 	if err := exportMetricsCSV(results, csvPath); err != nil {
 		fmt.Fprintf(os.Stderr, "Błąd zapisu CSV: %v\n", err)
